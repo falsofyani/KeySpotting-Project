@@ -179,6 +179,7 @@ def plot_det_per_keyword(X, y_true, keyword_embs):
     plt.show()
 
 def main():
+
     # Path to dataset
     DATA_DIR = "Arabic_Words"
 

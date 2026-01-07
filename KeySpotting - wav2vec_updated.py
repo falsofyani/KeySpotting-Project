@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import det_curve
 import torch
 import torchaudio
-from transformers import Wav2Vec2Model, Wav2Vec2Processor
+from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor
 from phonemizer import phonemize
 from scipy.spatial.distance import cosine
 
@@ -20,19 +20,27 @@ from scipy.spatial.distance import cosine
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
-# Replace custom GRU encoders with pretrained wav2vec 2.0 model 
-# Load pre-trained Wav2Vec2 model and processor
-processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-audio_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h").to(device)
+# Replace custom GRU encoders with pretrained wav2vec2-XLSR-53 model 
+# To support multilingual keyword spotting, we used wav2vec2-XLSR-53 model
+MODEL_NAME = "facebook/wav2vec2-large-xlsr-53"
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
+audio_model = Wav2Vec2Model.from_pretrained(MODEL_NAME).to(device)
 audio_model.eval()
 
 # Function to extract audio embedding using Wav2Vec2
 def extract_audio_embedding(wav_path):
     audio, sr = librosa.load(wav_path, sr=16000)
-    inputs = processor(audio, sampling_rate=16000, return_tensors="pt").to(device)
+    inputs = feature_extractor(audio, sampling_rate=16000, return_tensors="pt", padding=True)
+    # feature_extractor returns a dict with tensors under 'input_values'
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
     with torch.no_grad():
         outputs = audio_model(**inputs)
-    return outputs.last_hidden_state.mean(dim=1).cpu().numpy().squeeze()
+    
+    emb = outputs.last_hidden_state.mean(dim=1)
+    emb = torch.nn.functional.normalize(emb, dim=-1)
+
+    return emb.cpu().numpy().squeeze()
 
 # Function to convert text to phonemes (with fallback if espeak not installed)
 def text_to_phonemes(word):
@@ -56,11 +64,12 @@ def text_to_phonemes(word):
         print(f"Warning: phonemizer backend not available ({e}); falling back to characters.")
         return list(word)
 
-# simple phoneme embedding table (learned or random)
+# simple phoneme embedding table 
+# Use 1024-dim to match wav2vec2-XLSR-53 output dimension
 phoneme_vocab = {}
 def phoneme_embedding(p):
     if p not in phoneme_vocab:
-        phoneme_vocab[p] = np.random.randn(768)
+        phoneme_vocab[p] = np.random.randn(1024)
     return phoneme_vocab[p]
 
 # Function to extract text embedding from phonemes
@@ -85,6 +94,42 @@ def plot_det(keyword, audio_embeddings, text_embedding):
     fpr, fnr, _ = det_curve(labels, scores, pos_label=1)
     plt.plot(fpr, fnr, label=keyword)
 
+# Build keyword database from audio files
+def build_keyword_db(data_dir):
+    keyword_db = {}
+
+    for word in os.listdir(data_dir):
+        embs = []
+        word_dir = os.path.join(data_dir, word)
+
+        for f in os.listdir(word_dir):
+            wav_path = os.path.join(word_dir, f)
+            embs.append(extract_audio_embedding(wav_path))
+
+        keyword_db[word] = np.mean(embs, axis=0)
+
+    return keyword_db
+
+# Detect keyword in a test audio file
+def detect_keyword(test_wav, keyword_db, threshold=0.35):
+    # Extract embedding for test audio
+    test_emb = extract_audio_embedding(test_wav)
+
+    # Compute distances to all keywords
+    distances = {
+        keyword: cosine(test_emb, ref_emb)
+        for keyword, ref_emb in keyword_db.items()
+    }
+
+    # Find closest keyword
+    best_keyword = min(distances, key=distances.get)
+    best_distance = distances[best_keyword]
+
+    # Apply threshold
+    if best_distance < threshold:
+        return best_keyword, best_distance
+    else:
+        return "Unknown", distances
 
 def main():
 
@@ -92,6 +137,23 @@ def main():
 
     # Path to dataset
     DATA_DIR = "Arabic_Words"
+
+    # Build keyword database (TRAINING)
+    keyword_db = build_keyword_db(DATA_DIR)
+
+    print("Trained keywords:", keyword_db.keys())
+
+    # 2. Test with a NEW recording
+    test_wav = "test_audio/open in arabic1.wav"
+
+    result, score = detect_keyword(
+        test_wav=test_wav,
+        keyword_db=keyword_db,
+        threshold=0.35
+    )
+
+    print("Detection result:", result)
+    print("Score:", score)
 
     # Load audio embeddings
     for word in os.listdir(DATA_DIR):
